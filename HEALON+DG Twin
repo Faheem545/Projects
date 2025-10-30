@@ -1,0 +1,377 @@
+import tkinter as tk
+from tkinter import filedialog, ttk, messagebox
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LinearRegression  # For simple twin simulation
+import requests
+import numpy as np
+from datetime import datetime, timedelta
+import io
+import scipy.stats as stats  # For Gaussian-based edge detection
+
+def fetch_nasa_insolation(lat, lon):
+    """
+    Fetch annual average daily insolation from NASA POWER API (climatology).
+    Returns insolation in kWh/m²/day.
+    """
+    url = f"https://power.larc.nasa.gov/api/temporal/climatology/point?latitude={lat}&longitude={lon}&parameters=ALLSKY_SFC_SW_DWN&community=RE&format=JSON"
+    try:
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        parameters = data.get('properties', {}).get('parameter', {})
+        if 'ALLSKY_SFC_SW_DWN' in parameters:
+            ann = parameters['ALLSKY_SFC_SW_DWN'].get('ANN', None)
+            if ann is not None:
+                return ann
+            # Fallback to average of monthly values
+            monthly = [parameters['ALLSKY_SFC_SW_DWN'][f"{m:02d}"] for m in range(1, 13)]
+            return np.mean(monthly)
+        else:
+            raise ValueError("No insolation data found.")
+    except Exception as e:
+        messagebox.showerror("NASA Error", f"Error fetching NASA data: {e}")
+        return None
+
+SYSTEM_EFFICIENCY = 0.75
+
+class DataAnalysisApp:
+    def __init__(self, root):
+        self.root = root
+        root.title("Appliance Data Analysis GUI with HEALON & Digital Twin")
+        root.geometry("1200x800")
+
+        self.df = None
+        self.devices = []
+        self.insolation = None
+
+        # Left frame for controls
+        left_frame = ttk.Frame(root, padding=10)
+        left_frame.pack(side=tk.LEFT, fill=tk.Y)
+
+        # Load CSV button
+        ttk.Button(left_frame, text="Load CSV File", command=self.load_csv).pack(pady=5)
+
+        # Location inputs
+        ttk.Label(left_frame, text="Latitude:").pack()
+        self.lat_var = tk.StringVar(value="37.7749")  # Default San Francisco
+        ttk.Entry(left_frame, textvariable=self.lat_var).pack()
+
+        ttk.Label(left_frame, text="Longitude:").pack()
+        self.lon_var = tk.StringVar(value="-122.4194")
+        ttk.Entry(left_frame, textvariable=self.lon_var).pack()
+
+        # Fetch Insolation button
+        ttk.Button(left_frame, text="Fetch Insolation", command=self.fetch_insolation).pack(pady=5)
+
+        # Device selector
+        ttk.Label(left_frame, text="Select Device:").pack()
+        self.device_combo = ttk.Combobox(left_frame, state="readonly")
+        self.device_combo.pack()
+
+        # Analyze button
+        ttk.Button(left_frame, text="Analyze Device with HEALON", command=self.analyze_device).pack(pady=5)
+
+        # Digital Twin button
+        ttk.Button(left_frame, text="Run Digital Twin Simulation", command=self.run_digital_twin).pack(pady=5)
+
+        # Text widget for results
+        self.results_text = tk.Text(left_frame, height=15, width=40)
+        self.results_text.pack(pady=5)
+
+        # Right frame for plots
+        self.right_frame = ttk.Frame(root)
+        self.right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        # Canvas for plots (now 4 subplots for twin residuals)
+        self.fig, self.axs = plt.subplots(4, 1, figsize=(8, 12))
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.right_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    def load_csv(self):
+        path = filedialog.askopenfilename(filetypes=[("CSV Files", "*.csv")])
+        if path:
+            try:
+                self.df = pd.read_csv(path)
+                if all(col in self.df.columns for col in ['Date', 'Time', 'device_id', 'usage_kw', 'temp']):
+                    self.df['timestamp'] = pd.to_datetime(self.df['Date'] + ' ' + self.df['Time'])
+                    self.df['usage_kw'] = pd.to_numeric(self.df['usage_kw'], errors='coerce').fillna(0.0)
+                    self.df['temp'] = pd.to_numeric(self.df['temp'], errors='coerce').fillna(0.0)
+                    self.devices = sorted(self.df['device_id'].unique())
+                    self.device_combo['values'] = self.devices
+                    if self.devices:
+                        self.device_combo.current(0)
+                    messagebox.showinfo("Success", f"Loaded {len(self.df)} rows from {path}")
+                else:
+                    messagebox.showerror("Error", "CSV must have columns: Date, Time, device_id, usage_kw, temp")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to load CSV: {e}")
+
+    def fetch_insolation(self):
+        try:
+            lat = float(self.lat_var.get())
+            lon = float(self.lon_var.get())
+            self.insolation = fetch_nasa_insolation(lat, lon)
+            if self.insolation is None:
+                self.insolation = 4.5  # Default
+                messagebox.showinfo("Default", "Using default insolation of 4.5 kWh/m²/day")
+            self.results_text.insert(tk.END, f"Insolation: {self.insolation:.2f} kWh/m²/day\n")
+        except ValueError:
+            messagebox.showerror("Input Error", "Latitude and longitude must be numbers.")
+
+    def analyze_device(self):
+        if self.df is None:
+            messagebox.showerror("Error", "Load CSV first.")
+            return
+        if self.insolation is None:
+            messagebox.showerror("Error", "Fetch insolation first.")
+            return
+        device = self.device_combo.get()
+        if not device:
+            messagebox.showerror("Error", "Select a device.")
+            return
+
+        ddf = self.df[self.df['device_id'] == device].copy()
+        ddf = ddf.sort_values('timestamp')
+
+        # Calculate energy
+        ddf['time_diff_hours'] = ddf['timestamp'].diff().dt.total_seconds() / 3600.0
+        ddf['time_diff_hours'].fillna(1.0, inplace=True)
+        ddf['energy_kwh'] = ddf['usage_kw'] * ddf['time_diff_hours']
+
+        total_kwh = ddf['energy_kwh'].sum()
+        total_days = (ddf['timestamp'].max() - ddf['timestamp'].min()).days + 1 if len(ddf) > 1 else 1
+        daily_kwh = total_kwh / total_days
+        yearly_kwh = daily_kwh * 365
+        pv_kw = daily_kwh / (self.insolation * SYSTEM_EFFICIENCY)
+
+        # Clear results text
+        self.results_text.delete(1.0, tk.END)
+        self.results_text.insert(tk.END, f"Device: {device}\n")
+        self.results_text.insert(tk.END, f"Total Energy: {total_kwh:.2f} kWh over {total_days} days\n")
+        self.results_text.insert(tk.END, f"Daily Average: {daily_kwh:.2f} kWh\n")
+        self.results_text.insert(tk.END, f"Yearly Projection: {yearly_kwh:.2f} kWh\n")
+        self.results_text.insert(tk.END, f"Solar Capacity Required: {pv_kw:.2f} kW\n")
+
+        # HEALON Implementation with temperature caps and gradual rise detection
+        if len(ddf) > 10:
+            # Temperature cap rules
+            ddf['temp_anomaly_high'] = ddf['temp'] > 85
+            ddf['temp_critical'] = ddf['temp'] > 90
+
+            num_high_anomalies = ddf['temp_anomaly_high'].sum()
+            num_critical = ddf['temp_critical'].sum()
+            if num_high_anomalies > 0:
+                self.results_text.insert(tk.END, f"High Temp Anomalies (>85°C, potential fault): {num_high_anomalies}\n")
+            if num_critical > 0:
+                self.results_text.insert(tk.END, f"Critical Temp (>90°C, fire hazard/sure fault): {num_critical}\n")
+                anomalous_times_critical = ddf[ddf['temp_critical']]['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S').tolist()
+                self.results_text.insert(tk.END, "Critical Timestamps:\n" + "\n".join(anomalous_times_critical) + "\n")
+
+            # Gradual rise detection: Check daily mean temp increases
+            ddf['day'] = ddf['timestamp'].dt.date
+            daily_means = ddf.groupby('day')['temp'].mean().reset_index()
+            if len(daily_means) > 2:
+                daily_means['diff'] = daily_means['temp'].diff()
+                daily_means['increasing'] = daily_means['diff'] > 0
+                # Flag if 2+ consecutive increases
+                daily_means['gradual_rise'] = daily_means['increasing'].rolling(window=2).sum() >= 2
+                rise_days = daily_means[daily_means['gradual_rise']]['day'].tolist()
+                if rise_days:
+                    self.results_text.insert(tk.END, f"Gradual Temp Rise Detected on Days: {', '.join(map(str, rise_days))}\n")
+                    # Map back to ddf
+                    ddf['gradual_rise_anomaly'] = ddf['day'].isin(rise_days)
+                    num_gradual = ddf['gradual_rise_anomaly'].sum()
+                    self.results_text.insert(tk.END, f"Points in Gradual Rise Periods: {num_gradual}\n")
+                else:
+                    ddf['gradual_rise_anomaly'] = False
+            else:
+                self.results_text.insert(tk.END, "Not enough days for gradual rise detection.\n")
+                ddf['gradual_rise_anomaly'] = False
+
+            # Edge-level anomaly detection (Gaussian 3-sigma filter + temp rules)
+            mean_usage = ddf['usage_kw'].mean()
+            std_usage = ddf['usage_kw'].std()
+            mean_temp = ddf['temp'].mean()
+            std_temp = ddf['temp'].std()
+            threshold = 3  # 3 sigma for outliers
+
+            ddf['edge_anomaly'] = ((ddf['usage_kw'] > mean_usage + threshold * std_usage) |
+                                   (ddf['usage_kw'] < mean_usage - threshold * std_usage) |
+                                   (ddf['temp'] > mean_temp + threshold * std_temp) |
+                                   (ddf['temp'] < mean_temp - threshold * std_temp) |
+                                   ddf['temp_anomaly_high'] | ddf['gradual_rise_anomaly'])
+
+            num_edge_anomalies = ddf['edge_anomaly'].sum()
+            self.results_text.insert(tk.END, f"Edge-Level Anomalies: {num_edge_anomalies}\n")
+
+            if num_edge_anomalies > 0:
+                # Data optimization: "Compress" by selecting only anomalous rows and features
+                anomalous_df = ddf[ddf['edge_anomaly']][['usage_kw', 'temp', 'timestamp']]
+
+                # Cloud-level classification (IsolationForest on "transmitted" data)
+                features = anomalous_df[['usage_kw', 'temp']]
+                scaler = StandardScaler()
+                features_scaled = scaler.fit_transform(features)
+                iso = IsolationForest(contamination=0.05, random_state=42)
+                iso.fit(features_scaled)
+                cloud_anomalies = iso.predict(features_scaled)
+                anomalous_df['cloud_anomaly'] = cloud_anomalies == -1
+
+                num_cloud_anomalies = anomalous_df['cloud_anomaly'].sum()
+                self.results_text.insert(tk.END, f"Cloud-Level Confirmed Anomalies: {num_cloud_anomalies}\n")
+
+                if num_cloud_anomalies > 0:
+                    anomalous_times = anomalous_df[anomalous_df['cloud_anomaly']]['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S').tolist()
+                    self.results_text.insert(tk.END, "Confirmed Anomalous Timestamps:\n" + "\n".join(anomalous_times) + "\n")
+                    if num_cloud_anomalies / num_edge_anomalies > 0.5:  # Adaptive: high confirmation rate
+                        self.results_text.insert(tk.END, "Warning: Device may be faulty (high confirmed anomalies).\n")
+                else:
+                    self.results_text.insert(tk.END, "No confirmed anomalies at cloud level.\n")
+
+                # Merge back for plotting
+                ddf = ddf.merge(anomalous_df[['timestamp', 'cloud_anomaly']], on='timestamp', how='left')
+                ddf['cloud_anomaly'].fillna(False, inplace=True)
+            else:
+                self.results_text.insert(tk.END, "No edge anomalies; skipping cloud analysis (load optimized).\n")
+                ddf['cloud_anomaly'] = False
+        else:
+            self.results_text.insert(tk.END, "Not enough data for HEALON anomaly detection.\n")
+            ddf['edge_anomaly'] = False
+            ddf['cloud_anomaly'] = False
+            ddf['temp_anomaly_high'] = False
+            ddf['temp_critical'] = False
+            ddf['gradual_rise_anomaly'] = False
+
+        # Plot (using first 3 subplots for HEALON, reserve 4th for twin later)
+        for ax in self.axs:
+            ax.clear()
+
+        # Plot 1: Power Usage with anomalies
+        self.axs[0].plot(ddf['timestamp'], ddf['usage_kw'], label='Power (kW)')
+        self.axs[0].scatter(ddf[ddf['edge_anomaly']]['timestamp'], ddf[ddf['edge_anomaly']]['usage_kw'], color='orange', label='Edge Anomaly')
+        self.axs[0].scatter(ddf[ddf['cloud_anomaly']]['timestamp'], ddf[ddf['cloud_anomaly']]['usage_kw'], color='red', label='Cloud Confirmed')
+        self.axs[0].set_title(f"{device} Power Usage")
+        self.axs[0].set_ylabel('kW')
+        self.axs[0].legend()
+        self.axs[0].grid(True)
+
+        # Plot 2: Temperature with anomalies (add critical in purple)
+        self.axs[1].plot(ddf['timestamp'], ddf['temp'], label='Temp (°C)', color='orange')
+        self.axs[1].scatter(ddf[ddf['edge_anomaly']]['timestamp'], ddf[ddf['edge_anomaly']]['temp'], color='orange', label='Edge Anomaly')
+        self.axs[1].scatter(ddf[ddf['cloud_anomaly']]['timestamp'], ddf[ddf['cloud_anomaly']]['temp'], color='red', label='Cloud Confirmed')
+        self.axs[1].scatter(ddf[ddf['temp_critical']]['timestamp'], ddf[ddf['temp_critical']]['temp'], color='purple', label='Critical (>90°C)')
+        self.axs[1].scatter(ddf[ddf['gradual_rise_anomaly']]['timestamp'], ddf[ddf['gradual_rise_anomaly']]['temp'], color='cyan', label='Gradual Rise')
+        self.axs[1].set_title(f"{device} Temperature")
+        self.axs[1].set_ylabel('°C')
+        self.axs[1].legend()
+        self.axs[1].grid(True)
+
+        # Plot 3: Cumulative Energy
+        ddf['cumulative_kwh'] = ddf['energy_kwh'].cumsum()
+        self.axs[2].plot(ddf['timestamp'], ddf['cumulative_kwh'], label='Cumulative kWh', color='green')
+        self.axs[2].set_title(f"{device} Cumulative Energy")
+        self.axs[2].set_ylabel('kWh')
+        self.axs[2].legend()
+        self.axs[2].grid(True)
+
+        # Plot 4: Placeholder for twin residuals
+        self.axs[3].set_title(f"{device} Digital Twin Residuals (Run Twin to View)")
+        self.axs[3].grid(True)
+
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+        # Store ddf for twin use
+        self.current_ddf = ddf
+        self.current_device = device
+
+    def run_digital_twin(self):
+        if hasattr(self, 'current_ddf') and self.current_ddf is not None:
+            ddf = self.current_ddf.copy()
+            device = self.current_device
+
+            # Digital Twin Simulation: Simple linear regression model for expected values
+            # Use time as feature (numeric index for regression)
+            ddf['time_index'] = np.arange(len(ddf))
+            model_usage = LinearRegression()
+            model_temp = LinearRegression()
+            X = ddf[['time_index']]
+            model_usage.fit(X, ddf['usage_kw'])
+            model_temp.fit(X, ddf['temp'])
+
+            # Simulate "twin" values
+            ddf['twin_usage_kw'] = model_usage.predict(X)
+            ddf['twin_temp'] = model_temp.predict(X)
+
+            # Compute residuals for anomaly detection
+            ddf['residual_usage'] = np.abs(ddf['usage_kw'] - ddf['twin_usage_kw'])
+            ddf['residual_temp'] = np.abs(ddf['temp'] - ddf['twin_temp'])
+
+            # Twin-based anomalies (e.g., residuals > 2 std)
+            mean_res_usage = ddf['residual_usage'].mean()
+            std_res_usage = ddf['residual_usage'].std()
+            mean_res_temp = ddf['residual_temp'].mean()
+            std_res_temp = ddf['residual_temp'].std()
+            threshold = 2  # More sensitive for twin
+            ddf['twin_anomaly'] = ((ddf['residual_usage'] > mean_res_usage + threshold * std_res_usage) |
+                                   (ddf['residual_temp'] > mean_res_temp + threshold * std_res_temp))
+
+            num_twin_anomalies = ddf['twin_anomaly'].sum()
+            self.results_text.insert(tk.END, f"\nDigital Twin Anomalies: {num_twin_anomalies}\n")
+            if num_twin_anomalies > 0:
+                anomalous_times = ddf[ddf['twin_anomaly']]['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S').tolist()
+                self.results_text.insert(tk.END, "Twin Anomalous Timestamps:\n" + "\n".join(anomalous_times) + "\n")
+                if num_twin_anomalies / len(ddf) > 0.1:
+                    self.results_text.insert(tk.END, "Twin Warning: Potential fault detected via simulation residuals.\n")
+
+            # Simulate future (e.g., next 24 hours)
+            future_hours = 24
+            last_time = ddf['timestamp'].max()
+            future_times = [last_time + timedelta(hours=i) for i in range(1, future_hours + 1)]
+            future_index = np.arange(len(ddf), len(ddf) + future_hours)
+            future_df = pd.DataFrame({'timestamp': future_times, 'time_index': future_index})
+            future_df['twin_usage_kw'] = model_usage.predict(future_df[['time_index']])
+            future_df['twin_temp'] = model_temp.predict(future_df[['time_index']])
+            future_df['twin_energy_kwh'] = future_df['twin_usage_kw'] * 1.0  # Assume 1-hour intervals
+            projected_kwh = future_df['twin_energy_kwh'].sum()
+            self.results_text.insert(tk.END, f"Twin Projected Energy (Next {future_hours}h): {projected_kwh:.2f} kWh\n")
+
+            # Update plots with twin data
+            # Plot 1: Add twin usage
+            self.axs[0].plot(ddf['timestamp'], ddf['twin_usage_kw'], label='Twin Usage (kW)', linestyle='--', color='purple')
+            self.axs[0].plot(future_df['timestamp'], future_df['twin_usage_kw'], label='Future Twin Usage', linestyle=':', color='purple')
+            self.axs[0].legend()
+
+            # Plot 2: Add twin temp
+            self.axs[1].plot(ddf['timestamp'], ddf['twin_temp'], label='Twin Temp (°C)', linestyle='--', color='brown')
+            self.axs[1].plot(future_df['timestamp'], future_df['twin_temp'], label='Future Twin Temp', linestyle=':', color='brown')
+            self.axs[1].legend()
+
+            # Plot 3: Add projected cumulative
+            last_cum = ddf['cumulative_kwh'].iloc[-1]
+            future_df['cumulative_kwh'] = last_cum + future_df['twin_energy_kwh'].cumsum()
+            self.axs[2].plot(future_df['timestamp'], future_df['cumulative_kwh'], label='Future Cumulative kWh', linestyle=':', color='green')
+            self.axs[2].legend()
+
+            # Plot 4: Residuals
+            self.axs[3].plot(ddf['timestamp'], ddf['residual_usage'], label='Usage Residual', color='blue')
+            self.axs[3].plot(ddf['timestamp'], ddf['residual_temp'], label='Temp Residual', color='orange')
+            self.axs[3].scatter(ddf[ddf['twin_anomaly']]['timestamp'], ddf[ddf['twin_anomaly']]['residual_usage'], color='red', label='Twin Anomaly')
+            self.axs[3].set_title(f"{device} Digital Twin Residuals")
+            self.axs[3].set_ylabel('Absolute Residual')
+            self.axs[3].legend()
+            self.axs[3].grid(True)
+
+            self.fig.tight_layout()
+            self.canvas.draw()
+        else:
+            messagebox.showerror("Error", "Run HEALON analysis first to select device.")
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = DataAnalysisApp(root)
+    root.mainloop()
